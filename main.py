@@ -31,8 +31,28 @@ logger = logging.getLogger("tgcat")
 
 def load_config() -> dict:
     if not os.path.exists(config_path):
-        logger.error("config.json not found")
-        sys.exit(1)
+        default_cfg = {
+            "api_id": 1234567,
+            "api_hash": "your_api_hash_here",
+            "session_name": "tgcat_session",
+            "channel_id": "@your_channel_username",
+            "post_caption_template": "#{counter}",
+            "delete_old_avatar": false,
+            "prep_seconds_before": 30,
+            "target_minutes": [0, 20, 40],
+            "proxy": {
+                "enabled": false,
+                "protocol": "socks5",
+                "ip": "1.2.3.4",
+                "port": 10808,
+                "username": "",
+                "password": ""
+            }
+        }
+        with open(config_path, "w", encoding="utf-8") as f:
+            json.dump(default_cfg, f, indent=2, ensure_ascii=False)
+        logger.info("created default config.json, please fill api_id and api_hash and run again")
+        sys.exit(0)
     with open(config_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
