@@ -30,7 +30,8 @@ pip install -r requirements.txt
 Заполните в нем свои данные:
 - `api_id` и `api_hash`: ключи приложения с сайта my.telegram.org.
 - `channel_id`: юзернейм или ID канала.
-- `proxy`: параметры SOCKS5 или HTTP прокси.
+- `ssh_tunnel`: параметры встроенного SSH-туннеля для обхода блокировок.
+- `proxy`: параметры стороннего SOCKS5 или HTTP прокси.
 
 Файлы `counter.txt` и сессия `*.session` также создаются скриптом автоматически.
 

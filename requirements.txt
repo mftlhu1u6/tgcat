@@ -3,3 +3,4 @@ aiohttp>=3.9.0
 aiohttp-socks>=0.8.4
 python-socks>=2.4.4
 PySocks>=1.7.1
+asyncssh>=2.17.0

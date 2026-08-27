@@ -6,10 +6,10 @@ import logging
 import os
 import signal
 import sys
-import time
 from datetime import datetime, timedelta
 
 import aiohttp
+import asyncssh
 from aiohttp_socks import ProxyConnector
 from telethon import TelegramClient, types
 from telethon.tl.functions.photos import (
@@ -40,6 +40,14 @@ def load_config() -> dict:
             "delete_old_avatar": false,
             "prep_seconds_before": 30,
             "target_minutes": [0, 20, 40],
+            "ssh_tunnel": {
+                "enabled": false,
+                "host": "1.2.3.4",
+                "port": 22,
+                "username": "root",
+                "password": "",
+                "local_port": 10808
+            },
             "proxy": {
                 "enabled": false,
                 "protocol": "socks5",
@@ -88,8 +96,70 @@ def parse_channel_id(target):
     return s
 
 
-def get_telethon_proxy(cfg: dict):
-    proxy_cfg = cfg.get("proxy", {})
+async def start_ssh_tunnel(cfg: dict):
+    ssh_cfg = cfg.get("ssh_tunnel", {})
+    if not ssh_cfg.get("enabled"):
+        return None, None
+
+    host = ssh_cfg.get("host")
+    port = int(ssh_cfg.get("port", 22))
+    username = ssh_cfg.get("username", "root")
+    password = ssh_cfg.get("password") or None
+    local_port = int(ssh_cfg.get("local_port", 10808))
+
+    logger.info("connecting ssh tunnel to %s:%d (user: %s)...", host, port, username)
+    try:
+        conn = await asyncssh.connect(
+            host,
+            port=port,
+            username=username,
+            password=password,
+            known_hosts=None,
+            keepalive_interval=30,
+            keepalive_count_max=3,
+        )
+        listener = await conn.forward_socks("127.0.0.1", local_port)
+        logger.info("ssh tunnel established (local socks5 on 127.0.0.1:%d)", local_port)
+        return conn, listener
+    except Exception as e:
+        logger.error("ssh tunnel failed: %s", e)
+        raise
+
+
+async def ensure_ssh_tunnel(cfg: dict, ssh_conn, ssh_listener):
+    if not cfg.get("ssh_tunnel", {}).get("enabled"):
+        return None, None
+
+    if ssh_conn is not None and not ssh_conn.is_closed():
+        return ssh_conn, ssh_listener
+
+    if ssh_conn is not None and ssh_conn.is_closed():
+        logger.warning("ssh tunnel dropped, reconnecting...")
+
+    if ssh_listener:
+        ssh_listener.close()
+    if ssh_conn:
+        ssh_conn.close()
+
+    return await start_ssh_tunnel(cfg)
+
+
+def get_runtime_proxy(cfg: dict, ssh_listener=None) -> dict:
+    if ssh_listener:
+        ssh_cfg = cfg.get("ssh_tunnel", {})
+        local_port = int(ssh_cfg.get("local_port", 10808))
+        return {
+            "enabled": True,
+            "protocol": "socks5",
+            "ip": "127.0.0.1",
+            "port": local_port,
+            "username": "",
+            "password": "",
+        }
+    return cfg.get("proxy", {"enabled": False})
+
+
+def get_telethon_proxy(proxy_cfg: dict):
     if not proxy_cfg.get("enabled"):
         return None
     p_type = proxy_cfg.get("protocol", "socks5").lower()
@@ -105,8 +175,7 @@ def get_telethon_proxy(cfg: dict):
     return proxy
 
 
-def get_aiohttp_connector(cfg: dict) -> aiohttp.BaseConnector:
-    proxy_cfg = cfg.get("proxy", {})
+def get_aiohttp_connector(proxy_cfg: dict) -> aiohttp.BaseConnector:
     if not proxy_cfg.get("enabled"):
         return aiohttp.TCPConnector()
     proto = proxy_cfg.get("protocol", "socks5").lower()
@@ -129,13 +198,12 @@ def is_valid_image(data: bytes) -> bool:
     return False
 
 
-async def check_proxy_and_fetch_cat(cfg: dict, retries: int = 3, timeout_per_try: int = 8) -> bytes | None:
-    proxy_cfg = cfg.get("proxy", {})
+async def check_proxy_and_fetch_cat(proxy_cfg: dict, retries: int = 3, timeout_per_try: int = 8) -> bytes | None:
     proxy_enabled = proxy_cfg.get("enabled", False)
 
     for attempt in range(1, retries + 1):
         try:
-            connector = get_aiohttp_connector(cfg)
+            connector = get_aiohttp_connector(proxy_cfg)
             timeout = aiohttp.ClientTimeout(total=timeout_per_try)
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 try:
@@ -211,10 +279,10 @@ async def delete_previous_avatars(client: TelegramClient):
         logger.warning("failed to clean old avatars: %s", e)
 
 
-async def execute_round(client: TelegramClient, cfg: dict, target_time: datetime):
+async def execute_round(client: TelegramClient, cfg: dict, proxy_cfg: dict, target_time: datetime):
     logger.info("prep target: %s", target_time.strftime("%H:%M:%S"))
 
-    cat_bytes = await check_proxy_and_fetch_cat(cfg, retries=3, timeout_per_try=8)
+    cat_bytes = await check_proxy_and_fetch_cat(proxy_cfg, retries=3, timeout_per_try=8)
     if not cat_bytes:
         logger.error("proxy unavailable after 3 retries, skipping round until next interval")
         return
@@ -224,14 +292,17 @@ async def execute_round(client: TelegramClient, cfg: dict, target_time: datetime
     try:
         file_obj = io.BytesIO(cat_bytes)
         file_obj.name = "cat.jpg"
-        input_file = await client.upload_file(file_obj)
-        logger.info("image pre-uploaded to telegram")
+        try:
+            input_file = await client.upload_file(file_obj)
+            logger.info("image pre-uploaded to telegram")
+        finally:
+            file_obj.close()
     except Exception as e:
         logger.error("pre-upload failed: %s", e)
         return
 
     if not client.is_connected():
-        logger.info("reconnecting client...")
+        logger.info("reconnecting client to telegram...")
         await client.connect()
 
     now = datetime.now()
@@ -254,7 +325,7 @@ async def execute_round(client: TelegramClient, cfg: dict, target_time: datetime
     channel_target = parse_channel_id(cfg.get("channel_id"))
     counter = get_counter()
     caption_tpl = cfg.get("post_caption_template", "#{counter}")
-    caption = caption_tpl.format(counter=counter)
+    caption = caption_tpl.replace("{counter}", str(counter))
 
     try:
         photo_res = await client(UploadProfilePhotoRequest(file=input_file))
@@ -297,11 +368,15 @@ async def execute_round(client: TelegramClient, cfg: dict, target_time: datetime
 
 async def main():
     cfg = load_config()
-    proxy = get_telethon_proxy(cfg)
-    proxy_cfg = cfg.get("proxy", {})
 
-    if proxy_cfg.get("enabled"):
-        logger.info("proxy enabled: %s://%s:%s", proxy_cfg.get("protocol", "socks5"), proxy_cfg["ip"], proxy_cfg["port"])
+    ssh_conn, ssh_listener = None, None
+    ssh_conn, ssh_listener = await ensure_ssh_tunnel(cfg, ssh_conn, ssh_listener)
+
+    active_proxy = get_runtime_proxy(cfg, ssh_listener)
+    telethon_proxy = get_telethon_proxy(active_proxy)
+
+    if active_proxy.get("enabled"):
+        logger.info("proxy active: %s://%s:%s", active_proxy.get("protocol", "socks5"), active_proxy["ip"], active_proxy["port"])
 
     session_name = cfg.get("session_name", "tgcat_session")
     session_file = os.path.join(os.path.dirname(__file__), session_name)
@@ -310,7 +385,7 @@ async def main():
         session_file,
         cfg["api_id"],
         cfg["api_hash"],
-        proxy=proxy,
+        proxy=telethon_proxy,
     )
 
     logger.info("starting telegram client")
@@ -335,6 +410,9 @@ async def main():
 
     while not stop_event.is_set():
         try:
+            ssh_conn, ssh_listener = await ensure_ssh_tunnel(cfg, ssh_conn, ssh_listener)
+            active_proxy = get_runtime_proxy(cfg, ssh_listener)
+
             target_time = get_next_target_time(target_minutes)
             prep_time = target_time - timedelta(seconds=prep_seconds)
             now = datetime.now()
@@ -356,7 +434,7 @@ async def main():
             if stop_event.is_set():
                 break
 
-            await execute_round(client, cfg, target_time)
+            await execute_round(client, cfg, active_proxy, target_time)
 
             try:
                 await asyncio.wait_for(stop_event.wait(), timeout=5)
@@ -372,6 +450,13 @@ async def main():
 
     logger.info("disconnecting client...")
     await client.disconnect()
+
+    if ssh_listener:
+        ssh_listener.close()
+    if ssh_conn:
+        ssh_conn.close()
+        await ssh_conn.wait_closed()
+
     logger.info("shutdown complete.")
 
 
