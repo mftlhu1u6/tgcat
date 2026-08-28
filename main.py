@@ -39,7 +39,7 @@ def load_config() -> dict:
             "post_caption_template": "#{counter}",
             "delete_old_avatar": false,
             "prep_seconds_before": 30,
-            "target_minutes": [0, 20, 40],
+            "target_minutes": [0, 15, 30, 45],
             "ssh_tunnel": {
                 "enabled": false,
                 "host": "1.2.3.4",
@@ -240,6 +240,8 @@ async def check_proxy_and_fetch_cat(proxy_cfg: dict, retries: int = 3, timeout_p
 
 def get_next_target_time(target_minutes: list[int]) -> datetime:
     now = datetime.now()
+    if not target_minutes:
+        target_minutes = [0, 15, 30, 45]
     candidates = []
     for m in sorted(target_minutes):
         cand = now.replace(minute=m, second=0, microsecond=0)
@@ -393,7 +395,7 @@ async def main():
     logger.info("authorized")
 
     prep_seconds = cfg.get("prep_seconds_before", 30)
-    target_minutes = cfg.get("target_minutes", [0, 20, 40])
+    target_minutes = cfg.get("target_minutes", [0, 15, 30, 45])
 
     stop_event = asyncio.Event()
 

@@ -5,7 +5,7 @@
 [![platform](https://img.shields.io/badge/platform-linux%20%7C%20raspberry_pi-c51a4a?style=flat&logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/)
 [![license](https://img.shields.io/badge/license-GPLv3-blue?style=flat)](LICENSE)
 
-Скрипт для автоматической смены аватарки профиля в Telegram на случайные фотографии котов и публикации их в канал по расписанию (`:00`, `:20`, `:40`).
+Скрипт для автоматической смены аватарки профиля в Telegram на случайные фотографии котов и публикации их в канал по расписанию (`:00`, `:15`, `:30`, `:45`).
 
 ## Возможности
 
@@ -31,6 +31,8 @@ pip install -r requirements.txt
 Заполните в нем свои данные:
 - `api_id` и `api_hash`: ключи приложения с сайта my.telegram.org.
 - `channel_id`: юзернейм или ID канала.
+- `target_minutes`: список минут каждого часа для смены аватарок (по умолчанию `[0, 15, 30, 45]`).
+- `delete_old_avatar`: удалять ли предыдущие аватарки из профиля (`false` сохраняет историю).
 - `ssh_tunnel`: параметры встроенного SSH-туннеля для обхода блокировок.
 - `proxy`: параметры стороннего SOCKS5 или HTTP прокси.
 
