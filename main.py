@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import aiohttp
 import asyncssh
 from aiohttp_socks import ProxyConnector
-from telethon import TelegramClient, types
+from telethon import TelegramClient, errors, types
 from telethon.tl.functions.photos import (
     DeletePhotosRequest,
     GetUserPhotosRequest,
@@ -38,6 +38,7 @@ def load_config() -> dict:
             "channel_id": "@your_channel_username",
             "post_caption_template": "#{counter}",
             "delete_old_avatar": false,
+            "stop_on_flood_wait": true,
             "prep_seconds_before": 30,
             "target_minutes": [0, 15, 30, 45],
             "cat_api_key": "",
@@ -286,6 +287,9 @@ async def delete_previous_avatars(client: TelegramClient):
                 ]
                 await client(DeletePhotosRequest(id=to_delete))
                 logger.info("cleaned %d old avatar(s)", len(to_delete))
+    except errors.FloodError as e:
+        wait_secs = getattr(e, "seconds", 0)
+        logger.warning("flood error while cleaning avatars (%d seconds), skipping", wait_secs)
     except Exception as e:
         logger.warning("failed to clean old avatars: %s", e)
 
@@ -310,6 +314,16 @@ async def execute_round(client: TelegramClient, cfg: dict, proxy_cfg: dict, targ
             logger.info("image pre-uploaded to telegram")
         finally:
             file_obj.close()
+    except errors.FloodError as e:
+        wait_secs = getattr(e, "seconds", 0)
+        logger.error("flood error received during pre-upload (%d seconds)", wait_secs)
+        if cfg.get("stop_on_flood_wait", True):
+            logger.error("emergency stop enabled: terminating script to protect account")
+            raise
+        else:
+            logger.warning("cooling down for %d seconds...", wait_secs)
+            await asyncio.sleep(wait_secs + 2)
+            return
     except Exception as e:
         logger.error("pre-upload failed: %s", e)
         return
@@ -348,6 +362,16 @@ async def execute_round(client: TelegramClient, cfg: dict, proxy_cfg: dict, targ
             post_media = photo_res.photo if hasattr(photo_res, "photo") and photo_res.photo else input_file
             sent_msg = await client.send_message(channel_target, caption, file=post_media)
             logger.info("channel post sent: %s (id: %d)", caption, sent_msg.id)
+    except errors.FloodError as e:
+        wait_secs = getattr(e, "seconds", 0)
+        logger.error("flood error received from telegram (%d seconds)", wait_secs)
+        if cfg.get("stop_on_flood_wait", True):
+            logger.error("emergency stop enabled: terminating script to protect account")
+            raise
+        else:
+            logger.warning("cooling down for %d seconds...", wait_secs)
+            await asyncio.sleep(wait_secs + 2)
+            return
     except Exception as e:
         logger.error("commit failed: %s", e)
 
@@ -454,6 +478,9 @@ async def main():
             except asyncio.TimeoutError:
                 pass
 
+        except errors.FloodError:
+            logger.info("emergency flood protection triggered, stopping loop")
+            break
         except Exception as e:
             logger.error("main loop exception: %s", e, exc_info=True)
             try:
