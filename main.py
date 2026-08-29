@@ -40,6 +40,7 @@ def load_config() -> dict:
             "delete_old_avatar": false,
             "prep_seconds_before": 30,
             "target_minutes": [0, 15, 30, 45],
+            "cat_api_key": "",
             "ssh_tunnel": {
                 "enabled": false,
                 "host": "1.2.3.4",
@@ -198,8 +199,13 @@ def is_valid_image(data: bytes) -> bool:
     return False
 
 
-async def check_proxy_and_fetch_cat(proxy_cfg: dict, retries: int = 3, timeout_per_try: int = 8) -> bytes | None:
+async def check_proxy_and_fetch_cat(
+    proxy_cfg: dict, retries: int = 3, timeout_per_try: int = 8, cat_api_key: str | None = None
+) -> bytes | None:
     proxy_enabled = proxy_cfg.get("enabled", False)
+    headers = {}
+    if cat_api_key:
+        headers["x-api-key"] = cat_api_key.strip()
 
     for attempt in range(1, retries + 1):
         try:
@@ -207,7 +213,10 @@ async def check_proxy_and_fetch_cat(proxy_cfg: dict, retries: int = 3, timeout_p
             timeout = aiohttp.ClientTimeout(total=timeout_per_try)
             async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
                 try:
-                    async with session.get("https://api.thecatapi.com/v1/images/search?mime_types=jpg,png") as resp:
+                    async with session.get(
+                        "https://api.thecatapi.com/v1/images/search?mime_types=jpg,png",
+                        headers=headers,
+                    ) as resp:
                         if resp.status == 200:
                             data = await resp.json()
                             if data and "url" in data[0]:
@@ -284,7 +293,9 @@ async def delete_previous_avatars(client: TelegramClient):
 async def execute_round(client: TelegramClient, cfg: dict, proxy_cfg: dict, target_time: datetime):
     logger.info("prep target: %s", target_time.strftime("%H:%M:%S"))
 
-    cat_bytes = await check_proxy_and_fetch_cat(proxy_cfg, retries=3, timeout_per_try=8)
+    cat_bytes = await check_proxy_and_fetch_cat(
+        proxy_cfg, retries=3, timeout_per_try=8, cat_api_key=cfg.get("cat_api_key")
+    )
     if not cat_bytes:
         logger.error("proxy unavailable after 3 retries, skipping round until next interval")
         return
