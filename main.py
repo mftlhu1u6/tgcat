@@ -130,10 +130,10 @@ async def start_ssh_tunnel(cfg: dict):
 
 async def ensure_ssh_tunnel(cfg: dict, ssh_conn, ssh_listener):
     if not cfg.get("ssh_tunnel", {}).get("enabled"):
-        return None, None
+        return None, None, False
 
     if ssh_conn is not None and not ssh_conn.is_closed():
-        return ssh_conn, ssh_listener
+        return ssh_conn, ssh_listener, False
 
     if ssh_conn is not None and ssh_conn.is_closed():
         logger.warning("ssh tunnel dropped, reconnecting...")
@@ -143,7 +143,23 @@ async def ensure_ssh_tunnel(cfg: dict, ssh_conn, ssh_listener):
     if ssh_conn:
         ssh_conn.close()
 
-    return await start_ssh_tunnel(cfg)
+    conn, listener = await start_ssh_tunnel(cfg)
+    return conn, listener, True
+
+
+async def ensure_telegram_connected(client: TelegramClient, force_reconnect: bool = False):
+    if force_reconnect:
+        logger.info("reconnecting telegram after tunnel restart...")
+        try:
+            await client.disconnect()
+        except Exception:
+            pass
+        await client.connect()
+        return
+
+    if not client.is_connected():
+        logger.info("reconnecting client to telegram...")
+        await client.connect()
 
 
 def get_runtime_proxy(cfg: dict, ssh_listener=None) -> dict:
@@ -194,7 +210,7 @@ def get_aiohttp_connector(proxy_cfg: dict) -> aiohttp.BaseConnector:
 def is_valid_image(data: bytes) -> bool:
     if len(data) < 1024:
         return False
-    # jpeg, png, webp magic byte signatures
+    # img magic bytes
     if data.startswith(b"\xff\xd8\xff") or data.startswith(b"\x89PNG\r\n\x1a\n") or data.startswith(b"RIFF"):
         return True
     return False
@@ -270,7 +286,7 @@ async def sleep_until_exact_second(target_time: datetime):
     if coarse_sleep > 0:
         await asyncio.sleep(coarse_sleep)
 
-    # sub-millisecond spin to hit :01.000 exactly
+    # spin to hit :01.000
     while datetime.now() < target_time:
         await asyncio.sleep(0.001)
 
@@ -306,31 +322,39 @@ async def execute_round(client: TelegramClient, cfg: dict, proxy_cfg: dict, targ
 
     logger.info("image downloaded (%d bytes)", len(cat_bytes))
 
-    try:
-        file_obj = io.BytesIO(cat_bytes)
-        file_obj.name = "cat.jpg"
+    input_file = None
+    for attempt in range(2):
         try:
-            input_file = await client.upload_file(file_obj)
-            logger.info("image pre-uploaded to telegram")
-        finally:
-            file_obj.close()
-    except errors.FloodError as e:
-        wait_secs = getattr(e, "seconds", 0)
-        logger.error("flood error received during pre-upload (%d seconds)", wait_secs)
-        if cfg.get("stop_on_flood_wait", True):
-            logger.error("emergency stop enabled: terminating script to protect account")
-            raise
-        else:
-            logger.warning("cooling down for %d seconds...", wait_secs)
-            await asyncio.sleep(wait_secs + 2)
-            return
-    except Exception as e:
-        logger.error("pre-upload failed: %s", e)
-        return
+            await ensure_telegram_connected(client)
+            file_obj = io.BytesIO(cat_bytes)
+            file_obj.name = "cat.jpg"
+            try:
+                input_file = await client.upload_file(file_obj)
+                logger.info("image pre-uploaded to telegram")
+                break
+            finally:
+                file_obj.close()
+        except errors.FloodError as e:
+            wait_secs = getattr(e, "seconds", 0)
+            logger.error("flood error received during pre-upload (%d seconds)", wait_secs)
+            if cfg.get("stop_on_flood_wait", True):
+                logger.error("emergency stop enabled: terminating script to protect account")
+                raise
+            else:
+                logger.warning("cooling down for %d seconds...", wait_secs)
+                await asyncio.sleep(wait_secs + 2)
+                return
+        except Exception as e:
+            logger.warning("pre-upload attempt %d failed: %s", attempt + 1, e)
+            if attempt == 0:
+                await asyncio.sleep(1)
+                await ensure_telegram_connected(client, force_reconnect=True)
+            else:
+                logger.error("pre-upload failed: %s", e)
+                return
 
-    if not client.is_connected():
-        logger.info("reconnecting client to telegram...")
-        await client.connect()
+    if not input_file:
+        return
 
     now = datetime.now()
     time_diff = (target_time - now).total_seconds()
@@ -339,10 +363,12 @@ async def execute_round(client: TelegramClient, cfg: dict, proxy_cfg: dict, targ
         logger.warning("missed target tick during prep (lag: %.2fs), aborting", -time_diff)
         return
 
-    # target second :01 to ensure telegram server clock registers exact target minute
+    # target :01 for tg srv clock
     fire_time = target_time + timedelta(seconds=1)
     logger.info("waiting until target tick %s", fire_time.strftime("%H:%M:%S"))
     await sleep_until_exact_second(fire_time)
+
+    await ensure_telegram_connected(client)
 
     commit_start = datetime.now()
     logger.info("commit tick: %s", commit_start.strftime("%H:%M:%S.%f")[:12])
@@ -377,8 +403,10 @@ async def execute_round(client: TelegramClient, cfg: dict, proxy_cfg: dict, targ
 
     commit_end = datetime.now()
     is_in_exact_target_minute = (commit_end.hour, commit_end.minute) == (target_time.hour, target_time.minute)
+    post_ok = (sent_msg is not None) if channel_target else True
+    round_success = (photo_res is not None) and post_ok and is_in_exact_target_minute
 
-    if is_in_exact_target_minute:
+    if round_success:
         save_counter(counter + 1)
         logger.info("done, next counter: %d (finished at %s)", counter + 1, commit_end.strftime("%H:%M:%S"))
 
@@ -407,7 +435,7 @@ async def main():
     cfg = load_config()
 
     ssh_conn, ssh_listener = None, None
-    ssh_conn, ssh_listener = await ensure_ssh_tunnel(cfg, ssh_conn, ssh_listener)
+    ssh_conn, ssh_listener, _ = await ensure_ssh_tunnel(cfg, ssh_conn, ssh_listener)
 
     active_proxy = get_runtime_proxy(cfg, ssh_listener)
     telethon_proxy = get_telethon_proxy(active_proxy)
@@ -447,8 +475,9 @@ async def main():
 
     while not stop_event.is_set():
         try:
-            ssh_conn, ssh_listener = await ensure_ssh_tunnel(cfg, ssh_conn, ssh_listener)
+            ssh_conn, ssh_listener, tunnel_reconnected = await ensure_ssh_tunnel(cfg, ssh_conn, ssh_listener)
             active_proxy = get_runtime_proxy(cfg, ssh_listener)
+            await ensure_telegram_connected(client, force_reconnect=tunnel_reconnected)
 
             target_time = get_next_target_time(target_minutes)
             prep_time = target_time - timedelta(seconds=prep_seconds)
@@ -478,6 +507,9 @@ async def main():
             except asyncio.TimeoutError:
                 pass
 
+        except (errors.AuthKeyUnregisteredError, errors.UserDeactivatedError, errors.SessionRevokedError):
+            logger.error("session invalidated or revoked, terminating")
+            break
         except errors.FloodError:
             logger.info("emergency flood protection triggered, stopping loop")
             break
